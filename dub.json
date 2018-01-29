@@ -1,0 +1,11 @@
+{
+	"name": "nes",
+	"description": "NES emulator written in D",
+	"copyright": "Copyright © 2018, Blahness",
+	"authors": [ "Blahness" ],
+	"license": "MIT License",
+	"targetType": "library",
+	"targetName": "nes",
+	"dependencies": {
+	}
+}
