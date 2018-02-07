@@ -20,9 +20,9 @@ interface Mapper {
 
 class MapperException : Exception
 {
-    this(string msg, string file = __FILE__, size_t line = __LINE__) {
-        super(msg, file, line);
-    }
+    import std.exception : basicExceptionCtors;
+
+    mixin basicExceptionCtors;
 }
 
 Mapper NewMapper(Console console) {
