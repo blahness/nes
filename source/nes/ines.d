@@ -18,9 +18,9 @@ align(1) struct iNESFileHeader {
 
 class NesFileException : Exception
 {
-    this(string msg, string file = __FILE__, size_t line = __LINE__) {
-        super(msg, file, line);
-    }
+    import std.exception : basicExceptionCtors;
+    
+    mixin basicExceptionCtors;
 }
 
 // LoadNESFile reads an iNES file (.nes) and returns a Cartridge on success.

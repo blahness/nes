@@ -38,10 +38,10 @@ float[31] pulseTable;
 float[203] tndTable;
 
 static this() {
-    for (auto i = 0; i < 31; i++) {
+    foreach (i; 0 .. 31) {
         pulseTable[i] = 95.52 / (8128.0 / cast(float)i + 100);
     }
-    for (auto i = 0; i < 203; i++) {
+    foreach (i; 0 .. 203) {
         tndTable[i] = 163.67 / (24329.0 / cast(float)i + 100);
     }
 }

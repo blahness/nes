@@ -467,7 +467,7 @@ class PPU : PPUMemory {
         void writeDMA(ubyte value) {
             auto cpu = this.console.cpu;
             ushort address = cast(ushort)value << 8;
-            for (auto i = 0; i < 256; i++) {
+            foreach (_; 0 .. 256) {
                 this.oamData[this.oamAddress] = cpu.read(address);
                 this.oamAddress++;
                 address++;
@@ -586,7 +586,7 @@ class PPU : PPUMemory {
 
         void storeTileData() {
             uint data;
-            for (auto i = 0; i < 8; i++) {
+            foreach (_; 0 .. 8) {
                 auto a = this.attributeTableByte;
                 ubyte p1 = (this.lowTileByte & 0x80) >> 7;
                 ubyte p2 = (this.highTileByte & 0x80) >> 6;
@@ -614,7 +614,7 @@ class PPU : PPUMemory {
             if (this.flagShowSprites == 0) {
                 return SpritePixel(0, 0);
             }
-            for (auto i = 0; i < this.spriteCount; i++) {
+            foreach (i; 0 .. this.spriteCount) {
                 int offset = (this.cycle - 1) - cast(int)this.spritePositions[i];
                 if (offset < 0 || offset > 7) {
                     continue;
@@ -691,7 +691,7 @@ class PPU : PPUMemory {
             auto lowTileByte = this.read(address);
             auto highTileByte = this.read(cast(ushort)(address + 8));
             uint data;
-            for (auto c = 0; c < 8; c++) {
+            foreach (_; 0 .. 8) {
                 ubyte p1, p2;
                 if ((attributes & 0x40) == 0x40) {
                     p1 = (lowTileByte & 1) << 0;
@@ -718,7 +718,7 @@ class PPU : PPUMemory {
                 h = 16;
             }
             auto count = 0;
-            for (auto i = 0; i < 64; i++) {
+            foreach (i; 0 .. 64) {
                 auto y = this.oamData[i*4+0];
                 auto a = this.oamData[i*4+2];
                 auto x = this.oamData[i*4+3];

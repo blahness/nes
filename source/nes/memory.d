@@ -12,9 +12,9 @@ interface Memory {
 
 class MemoryException : Exception
 {
-    this(string msg, string file = __FILE__, size_t line = __LINE__) {
-        super(msg, file, line);
-    }
+    import std.exception : basicExceptionCtors;
+
+    mixin basicExceptionCtors;
 }
 
 class CPUMemory : Memory {
@@ -157,6 +157,6 @@ ushort MirrorAddress(ubyte mode, ushort address) {
     address = cast(ushort)(address - 0x2000) % 0x1000;
     auto table = address / 0x0400;
     auto offset = address % 0x0400;
-    
+
     return cast(ushort)(0x2000 + MirrorLookup[mode][table] * 0x0400 + offset);
 }

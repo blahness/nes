@@ -35,7 +35,7 @@ class Console {
         this.controller2 = new Controller();
 
         this.mapper = NewMapper(this);
-        
+
         this.cpu = new CPU(this);
         this.apu = new APU(this);
         this.ppu = new PPU(this);
@@ -49,12 +49,12 @@ class Console {
         auto cpuCycles = this.cpu.step();
         auto ppuCycles = cpuCycles * 3;
 
-        for (auto i = 0; i < ppuCycles; i++) {
+        foreach (_; 0 .. ppuCycles) {
             this.ppu.step();
             this.mapper.step();
         }
 
-        for (auto i = 0; i < cpuCycles; i++) {
+        foreach (_; 0 .. cpuCycles) {
             this.apu.step();
         }
 
