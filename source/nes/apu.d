@@ -1,13 +1,18 @@
 module nes.apu;
 
 import std.conv;
+import std.math;
 import std.stdio;
 
 import nes.console;
 import nes.cpu;
-import nes.filter;
 
-enum frameCounterRate = CPUFrequency / 240.0;
+import blip_buf;
+
+enum MAX_SAMPLE_RATE = 96000;
+
+ulong[6][2] stepCycles = [[7457, 14913, 22371, 29828, 29829, 29830],
+                          [7457, 14913, 22371, 29829, 37281, 37282]];
 
 ubyte[] lengthTable = [
     10, 254, 20, 2, 40, 4, 80, 6, 160, 8, 60, 10, 14, 12, 26, 14,
@@ -46,32 +51,88 @@ static this() {
     }
 }
 
-alias void delegate(float) ApuCallbackFuncType;
+alias void delegate(short) ApuCallbackFuncType;
 
 class APU {
     this(Console console) {
         this.console = console;
-        this.noise.shiftRegister = 1;
         this.pulse1.channel = 1;
         this.pulse2.channel = 2;
         this.dmc.cpu = console.cpu;
+
+        this.blipBuf = blip_new(MAX_SAMPLE_RATE);
+
+        this.reset(true);
+    }
+
+    ~this() {
+        blip_delete(this.blipBuf);
     }
 
     void step() {
         auto cycle1 = this.cycle;
         this.cycle++;
         auto cycle2 = this.cycle;
-        this.stepTimer();
-        auto f1 = cast(int)(cast(double)cycle1 / frameCounterRate);
-        auto f2 = cast(int)(cast(double)cycle2 / frameCounterRate);
-        if (f1 != f2) {
+
+        this.counter++;
+
+        if (this.counter >= stepCycles[this.stepMode][this.currentStep]) {
             this.stepFrameCounter();
         }
-        auto s1 = cast(int)(cast(double)cycle1 / this.sampleRate);
-        auto s2 = cast(int)(cast(double)cycle2 / this.sampleRate);
-        if (s1 != s2) {
-            this.sendSample();
+
+        if (this.frameCounterValue >= 0 && this.frameCounterDelay > 0)
+            tryDelayedFrameCounterWrite();
+
+        if (this.blockFrameCounterTick > 0) {
+            this.blockFrameCounterTick--;
         }
+
+        this.stepTimer();
+
+        short currentOutput = floatSampleToShort(this.output());
+
+        short delta = cast(short)(currentOutput - this.blipPrevOutput);
+
+        if (delta != 0) blip_add_delta(this.blipBuf, this.outputTick, delta);
+
+        this.blipPrevOutput = currentOutput;
+
+        this.outputTick++;
+
+        auto s1 = cast(int)(cast(double)cycle1 / this.ticksPerSample);
+        auto s2 = cast(int)(cast(double)cycle2 / this.ticksPerSample);
+        if (s1 != s2) {
+           this.sendSample();
+           this.outputTick = 0;
+        }
+    }
+
+    void reset(bool powerUp = false) {
+        this.cycle = 0;
+        this.counter = 0;
+        this.currentStep = 0;
+
+        this.inhibitIRQ = false;
+        this.frameIRQ = false;
+
+        this.frameCounterDelay = -1;
+        this.frameCounterValue = -1;
+        this.blockFrameCounterTick = 0;
+
+        this.writeControl(0);
+
+        this.pulse1.reset();
+        this.pulse2.reset();
+        this.triangle.reset(powerUp);
+        this.noise.reset();
+        this.dmc.reset();
+
+        this.outputTick = 0;
+
+        blip_clear(this.blipBuf);
+
+        foreach (_; 0 .. 8)
+            this.step();
     }
 
     ubyte readRegister(ushort address) {
@@ -159,14 +220,31 @@ class APU {
         }
     }
 
+    void setAudioSampleRate(double sampleRate) {
+        if (sampleRate != 0) {
+            if (sampleRate > MAX_SAMPLE_RATE) sampleRate = MAX_SAMPLE_RATE;
+
+            // Convert samples per second to cpu steps per sample
+            this.ticksPerSample = CPUFrequency / sampleRate;
+
+            blip_set_rates(this.blipBuf, CPUFrequency, sampleRate);
+        }
+    }
+
     void save(string[string] state) {
         state["apu.cycle"] = to!string(this.cycle);
-        state["apu.framePeriod"] = to!string(this.framePeriod);
-        state["apu.frameValue"] = to!string(this.frameValue);
         state["apu.frameIRQ"] = to!string(this.frameIRQ);
+        state["apu.inhibitIRQ"] = to!string(this.inhibitIRQ);
 
-        this.pulse1.save(state, "1");
-        this.pulse2.save(state, "2");
+        state["apu.counter"] = to!string(this.counter);
+        state["apu.stepMode"] = to!string(this.stepMode);
+        state["apu.currentStep"] = to!string(this.currentStep);
+        state["apu.frameCounterValue"] = to!string(this.frameCounterValue);
+        state["apu.frameCounterDelay"] = to!string(this.frameCounterDelay);
+        state["apu.blockFrameCounterTick"] = to!string(this.blockFrameCounterTick);
+
+        this.pulse1.save(state);
+        this.pulse2.save(state);
         this.triangle.save(state);
         this.noise.save(state);
         this.dmc.save(state);
@@ -174,38 +252,64 @@ class APU {
 
     void load(string[string] state) {
         this.cycle = to!ulong(state["apu.cycle"]);
-        this.framePeriod = to!ubyte(state["apu.framePeriod"]);
-        this.frameValue = to!ubyte(state["apu.frameValue"]);
         this.frameIRQ = to!bool(state["apu.frameIRQ"]);
+        this.inhibitIRQ = to!bool(state["apu.inhibitIRQ"]);
 
-        this.pulse1.load(state, "1");
-        this.pulse2.load(state, "2");
+        this.counter = to!ulong(state["apu.counter"]);
+        this.stepMode = to!uint(state["apu.stepMode"]);
+        this.currentStep = to!uint(state["apu.currentStep"]);
+        this.frameCounterValue = to!short(state["apu.frameCounterValue"]);
+        this.frameCounterDelay = to!byte(state["apu.frameCounterDelay"]);
+        this.blockFrameCounterTick = to!ubyte(state["apu.blockFrameCounterTick"]);
+
+        this.pulse1.load(state);
+        this.pulse2.load(state);
         this.triangle.load(state);
         this.noise.load(state);
         this.dmc.load(state);
     }
 
     package:
-        double              sampleRate;
         ApuCallbackFuncType callback;
-        FilterChain         filterChain;
 
-        Console console;
-        Pulse pulse1;
-        Pulse pulse2;
+        Console  console;
+        Pulse    pulse1;
+        Pulse    pulse2;
         Triangle triangle;
-        Noise noise;
-        DMC dmc;
-        ulong cycle;
-        ubyte framePeriod;
-        ubyte frameValue;
-        bool frameIRQ;
+        Noise    noise;
+        DMC      dmc;
+        ulong    cycle, counter;
+        bool     inhibitIRQ;
+        bool     frameIRQ;
 
     private:
+        uint    stepMode, currentStep;
+        short   frameCounterValue;
+        byte    frameCounterDelay;
+        ubyte   blockFrameCounterTick;
+        blip_t* blipBuf;
+        double  ticksPerSample;
+        uint    outputTick;
+        short   blipOutput, blipPrevOutput;
+        short[MAX_SAMPLE_RATE] outBuf;
+
         void sendSample() {
-            auto output = this.filterChain.step(this.output());
-            if (this.callback)
-                this.callback(output);
+            if (this.callback == null) return;
+
+            blip_end_frame(this.blipBuf, this.outputTick);
+
+            auto sampleCount = blip_read_samples(this.blipBuf, outBuf.ptr,
+                MAX_SAMPLE_RATE, 0);
+
+            for (uint i = 0; i < sampleCount; i++) {
+                this.callback(outBuf[i]);
+            }
+        }
+
+        short floatSampleToShort(float f) {
+            if (f > 1.0) f = 1.0;
+            if (f < -1.0) f = -1.0;
+            return cast(short)(f * 0x7fff);
         }
 
         float output() {
@@ -214,8 +318,11 @@ class APU {
             auto t = this.triangle.output();
             auto n = this.noise.output();
             auto d = this.dmc.output();
-            auto pulseOut = pulseTable[p1 + p2];
-            auto tndOut = tndTable[3 * t + 2 * n + d];
+
+            float pulseOut, tndOut;
+
+            pulseOut = pulseTable[p1 + p2];
+            tndOut = tndTable[3 * t + 2 * n + d];
 
             return pulseOut + tndOut;
         }
@@ -226,48 +333,43 @@ class APU {
         //  - l - l    l - l - -    Length counter and sweep
         //  e e e e    e e e e -    Envelope and linear counter
         void stepFrameCounter() {
-            switch (this.framePeriod) {
-                case 4:
-                    this.frameValue = (this.frameValue + 1) % 4;
-                    switch (this.frameValue) {
-                        case 0, 2:
-                            this.stepEnvelope();
-                            break;
-                        case 1:
-                            this.stepEnvelope();
-                            this.stepSweep();
-                            this.stepLength();
-                            break;
-                        case 3:
-                            this.stepEnvelope();
-                            this.stepSweep();
-                            this.stepLength();
-                            this.fireIRQ();
-                            break;
-                        default:
-                            break;
+            if (this.currentStep == 0 || this.currentStep == 2) {
+                if (!this.blockFrameCounterTick) {
+                    this.stepEnvelope();
+
+                    this.blockFrameCounterTick = 2;
+                }
+            }
+            else if (this.currentStep == 1 || this.currentStep == 4) {
+                if (!this.blockFrameCounterTick) {
+                    this.stepEnvelope();
+
+                    this.stepSweep();
+                    this.stepLength();
+
+                    this.blockFrameCounterTick = 2;
+                }
+
+                if (this.currentStep == 4 && this.stepMode == 0 && !this.inhibitIRQ) {
+                    this.frameIRQ = true;
+                }
+            }
+            else if (this.currentStep == 3 || this.currentStep == 5) {
+                if (this.stepMode == 0) {
+                    if (!this.inhibitIRQ) {
+                        this.frameIRQ = true;
+
+                        if (this.currentStep == 3) {
+                            this.console.cpu.addIrqSource(IrqSource.FrameCounter);
+                        }
                     }
+                }
+            }
 
-                    break;
-                case 5:
-                    this.frameValue = (this.frameValue + 1) % 5;
-                    switch (this.frameValue) {
-                        case 1, 3:
-                            this.stepEnvelope();
-                            break;
-                        case 0, 2:
-                            this.stepEnvelope();
-                            this.stepSweep();
-                            this.stepLength();
-                            break;
-                        default:
-                            break;
-                    }
-
-                    break;
-
-                default:
-                    break;
+            this.currentStep++;
+            if (this.currentStep == 6) {
+                this.currentStep = 0;
+                this.counter = 0;
             }
         }
 
@@ -300,14 +402,9 @@ class APU {
             this.noise.stepLength();
         }
 
-        void fireIRQ() {
-            if (this.frameIRQ) {
-                this.console.cpu.triggerIRQ();
-            }
-        }
-
         ubyte readStatus() {
             ubyte result;
+
             if (this.pulse1.lengthValue > 0) {
                 result |= 1;
             }
@@ -323,10 +420,22 @@ class APU {
             if (this.dmc.currentLength > 0) {
                 result |= 16;
             }
+            if (this.frameIRQ) {
+                result |= 64;
+            }
+            if (this.console.cpu.hasIrqSource(IrqSource.DMC)) {
+                result |= 128;
+            }
+
+            this.frameIRQ = false;
+            this.console.cpu.clearIrqSource(IrqSource.FrameCounter);
+
             return result;
         }
 
         void writeControl(ubyte value) {
+            this.console.cpu.clearIrqSource(IrqSource.DMC);
+
             this.pulse1.enabled = (value & 1) == 1;
             this.pulse2.enabled = (value & 2) == 2;
             this.triangle.enabled = (value & 4) == 4;
@@ -354,13 +463,43 @@ class APU {
         }
 
         void writeFrameCounter(ubyte value) {
-            this.framePeriod = 4 + ((value >> 7) & 1);
-            this.frameIRQ = ((value >> 6) & 1) == 0;
-            // this.frameValue = 0;
-            if (this.framePeriod == 5) {
-                this.stepEnvelope();
-                this.stepSweep();
-                this.stepLength();
+            this.frameCounterValue = value;
+
+            /**
+             * If the write occurs during an APU cycle, the effects occur 3 CPU cycles after the $4017 write cycle,
+             *  and if the write occurs between APU cycles, the effects occurs 4 CPU cycles after the write cycle.
+             * First CPU cycle we see is odd so even cycles are APU cycles.
+             */
+            this.frameCounterDelay = (this.console.cpu.cycles & 0x01) == 1 ? 4 : 3;
+
+            this.inhibitIRQ = ((value >> 6) & 1) == 1;
+
+            if (this.inhibitIRQ) {
+                this.frameIRQ = false;
+                this.console.cpu.clearIrqSource(IrqSource.FrameCounter);
+            }
+        }
+
+        void tryDelayedFrameCounterWrite() {
+            this.frameCounterDelay--;
+
+            if (this.frameCounterDelay == 0) {
+                ubyte value = cast(ubyte)this.frameCounterValue;
+
+                this.stepMode = ((value >> 7) & 1) ? 1 : 0;
+
+                if (this.stepMode == 1 && !this.blockFrameCounterTick) {
+                    this.stepEnvelope();
+                    this.stepSweep();
+                    this.stepLength();
+
+                    this.blockFrameCounterTick = 2;
+                }
+
+                this.currentStep = 0;
+                this.counter = 0;
+                this.frameCounterDelay = -1;
+                this.frameCounterValue = -1;
             }
         }
 }
@@ -371,7 +510,10 @@ struct Pulse {
     bool   enabled;
     ubyte  channel;
     bool   lengthEnabled;
+    bool   lengthEnabledNewValue;
     ubyte  lengthValue;
+    ubyte  lengthValueNew;
+    ubyte  lengthValuePrev;
     ushort timerPeriod;
     ushort timerValue;
     ubyte  dutyMode;
@@ -381,40 +523,78 @@ struct Pulse {
     bool   sweepNegate;
     ubyte  sweepShift;
     ubyte  sweepPeriod;
+    uint   sweepTargetPeriod;
     ubyte  sweepValue;
     bool   envelopeEnabled;
     bool   envelopeLoop;
     bool   envelopeStart;
-    ubyte  envelopePeriod;
-    ubyte  envelopeValue;
-    ubyte  envelopeVolume;
-    ubyte  constantVolume;
+    byte   envelopeDivider;
+    ubyte  envelopeCounter;
+    ubyte  envelopeConstantVolume;
 
-    void writeControl(ubyte value) {
-        this.dutyMode = (value >> 6) & 3;
-        this.lengthEnabled = ((value >> 5) & 1) == 0;
-        this.envelopeLoop = ((value >> 5) & 1) == 1;
-        this.envelopeEnabled = ((value >> 4) & 1) == 0;
-        this.envelopePeriod = value & 15;
-        this.constantVolume = value & 15;
-        this.envelopeStart = true;
+    void reset() {
+        this.dutyMode = 0;
+        this.dutyValue = 0;
+
+        this.timerPeriod = 0;
+
+        this.sweepEnabled = false;
+        this.sweepPeriod = 1;
+        this.sweepNegate = false;
+        this.sweepShift = 0;
+        this.sweepReload = true;
+        this.sweepValue = 0;
+        this.sweepTargetPeriod = 0;
+        this.updateSweepTargetPeriod();
+
+        this.lengthEnabled = true;
+        this.lengthEnabledNewValue = true;
+        this.lengthValue = 0;
+        this.lengthValueNew = 0;
+        this.lengthValuePrev = 0;
+
+        this.envelopeEnabled = false;
+        this.envelopeLoop = false;
+        this.envelopeConstantVolume = 0;
+        this.envelopeCounter = 0;
+        this.envelopeStart = false;
+        this.envelopeDivider = 0;
     }
 
+    // 0x4000 & 0x4004
+    void writeControl(ubyte value) {
+        this.dutyMode = (value >> 6) & 3;
+        this.lengthEnabledNewValue = ((value >> 5) & 1) == 0;
+        this.envelopeLoop = ((value >> 5) & 1) == 1;
+        this.envelopeEnabled = ((value >> 4) & 1) == 0;
+        this.envelopeConstantVolume = value & 15;
+    }
+
+    // 0x4001 & 0x4005
     void writeSweep(ubyte value) {
         this.sweepEnabled = ((value >> 7) & 1) == 1;
         this.sweepPeriod = ((value >> 4) & 7) + 1;
         this.sweepNegate = ((value >> 3) & 1) == 1;
         this.sweepShift = value & 7;
         this.sweepReload = true;
+        this.updateSweepTargetPeriod();
     }
 
+    // 0x4002 & 0x4006
     void writeTimerLow(ubyte value) {
         this.timerPeriod = (this.timerPeriod & 0xFF00) | cast(ushort)value;
+        this.updateSweepTargetPeriod();
     }
 
+    // 0x4003 & 0x4007
     void writeTimerHigh(ubyte value) {
-        this.lengthValue = lengthTable[value >> 3];
+        if (this.enabled) {
+            this.lengthValueNew = lengthTable[value >> 3];
+            this.lengthValuePrev = this.lengthValue;
+        }
+
         this.timerPeriod = (this.timerPeriod & 0x00FF) | (cast(ushort)(value & 7) << 8);
+        this.updateSweepTargetPeriod();
         this.envelopeStart = true;
         this.dutyValue = 0;
     }
@@ -430,35 +610,36 @@ struct Pulse {
 
     void stepEnvelope() {
         if (this.envelopeStart) {
-            this.envelopeVolume = 15;
-            this.envelopeValue = this.envelopePeriod;
             this.envelopeStart = false;
-        } else if (this.envelopeValue > 0) {
-            this.envelopeValue--;
-        } else {
-            if (this.envelopeVolume > 0) {
-                this.envelopeVolume--;
-            } else if (this.envelopeLoop) {
-                this.envelopeVolume = 15;
+            this.envelopeCounter = 15;
+            this.envelopeDivider = this.envelopeConstantVolume;
+        }  else {
+            this.envelopeDivider--;
+
+            if (this.envelopeDivider < 0) {
+                this.envelopeDivider = this.envelopeConstantVolume;
+                if (this.envelopeCounter > 0) {
+                    this.envelopeCounter--;
+                }
+                else if (this.envelopeLoop)
+                    this.envelopeCounter = 15;
             }
-            this.envelopeValue = this.envelopePeriod;
         }
     }
 
     void stepSweep() {
-        if (this.sweepReload) {
-            if (this.sweepEnabled && this.sweepValue == 0) {
-                this.sweep();
+        this.sweepValue--;
+        if (this.sweepValue == 0) {
+            if (this.sweepShift > 0 && this.sweepEnabled && this.timerPeriod >= 8 && this.sweepTargetPeriod <= 0x7ff) {
+                this.timerPeriod = cast(ushort)this.sweepTargetPeriod;
+                this.updateSweepTargetPeriod();
             }
+            this.sweepValue = this.sweepPeriod;
+        }
+
+        if (this.sweepReload) {
             this.sweepValue = this.sweepPeriod;
             this.sweepReload = false;
-        } else if (this.sweepValue > 0) {
-            this.sweepValue--;
-        } else {
-            if (this.sweepEnabled) {
-                this.sweep();
-            }
-            this.sweepValue = this.sweepPeriod;
         }
     }
 
@@ -468,48 +649,57 @@ struct Pulse {
         }
     }
 
-    void sweep() {
+    void updateSweepTargetPeriod() {
         auto delta = this.timerPeriod >> this.sweepShift;
         if (this.sweepNegate) {
-            this.timerPeriod -= delta;
+            this.sweepTargetPeriod = this.timerPeriod - delta;
             if (this.channel == 1) {
-                this.timerPeriod--;
+                this.sweepTargetPeriod--;
             }
         } else {
-            this.timerPeriod += delta;
+            this.sweepTargetPeriod = this.timerPeriod + delta;
         }
     }
 
     ubyte output() {
+        // Emulate 1 cycle delay
+        this.lengthEnabled = this.lengthEnabledNewValue;
+
+        // Emulate 1 cycle delay
+        if (this.lengthValueNew) {
+            if (this.lengthValue == this.lengthValuePrev) {
+                this.lengthValue = this.lengthValueNew;
+            }
+
+            this.lengthValueNew = 0;
+        }
+
         if (!this.enabled) {
             return 0;
         }
         if (this.lengthValue == 0) {
             return 0;
         }
-        if (dutyTable[this.dutyMode][this.dutyValue] == 0) {
+        if (this.timerPeriod < 8 || (!this.sweepNegate && this.sweepTargetPeriod > 0x7FF)) {
             return 0;
         }
-        if (this.timerPeriod < 8 || this.timerPeriod > 0x7FF) {
-            return 0;
-        }
-        // if (!this.sweepNegate && this.timerPeriod + (this.timerPeriod >> this.sweepShift) > 0x7FF) {
-        //  return 0;
-        // }
         if (this.envelopeEnabled) {
-            return this.envelopeVolume;
+            return cast(ubyte)(dutyTable[this.dutyMode][this.dutyValue] * this.envelopeCounter);
         } else {
-            return this.constantVolume;
+            return cast(ubyte)(dutyTable[this.dutyMode][this.dutyValue] * this.envelopeConstantVolume);
         }
     }
 
-    void save(string[string] state, string id) {
-        id = "apu.pulse" ~ id;
+    void save(string[string] state) {
+        auto id = "apu.pulse" ~ to!string(this.channel);
 
         state[id ~ ".enabled"] = to!string(this.enabled);
         state[id ~ ".channel"] = to!string(this.channel);
         state[id ~ ".lengthEnabled"] = to!string(this.lengthEnabled);
+        state[id ~ ".lengthEnabledNewValue"] = to!string(this.lengthEnabledNewValue);
         state[id ~ ".lengthValue"] = to!string(this.lengthValue);
+        state[id ~ ".lengthValueNew"] = to!string(this.lengthValueNew);
+        state[id ~ ".lengthValuePrev"] = to!string(this.lengthValuePrev);
         state[id ~ ".timerPeriod"] = to!string(this.timerPeriod);
         state[id ~ ".timerValue"] = to!string(this.timerValue);
         state[id ~ ".dutyMode"] = to!string(this.dutyMode);
@@ -519,23 +709,26 @@ struct Pulse {
         state[id ~ ".sweepNegate"] = to!string(this.sweepNegate);
         state[id ~ ".sweepShift"] = to!string(this.sweepShift);
         state[id ~ ".sweepPeriod"] = to!string(this.sweepPeriod);
+        state[id ~ ".sweepTargetPeriod"] = to!string(this.sweepTargetPeriod);
         state[id ~ ".sweepValue"] = to!string(this.sweepValue);
         state[id ~ ".envelopeEnabled"] = to!string(this.envelopeEnabled);
         state[id ~ ".envelopeLoop"] = to!string(this.envelopeLoop);
         state[id ~ ".envelopeStart"] = to!string(this.envelopeStart);
-        state[id ~ ".envelopePeriod"] = to!string(this.envelopePeriod);
-        state[id ~ ".envelopeValue"] = to!string(this.envelopeValue);
-        state[id ~ ".envelopeVolume"] = to!string(this.envelopeVolume);
-        state[id ~ ".constantVolume"] = to!string(this.constantVolume);
+        state[id ~ ".envelopeDivider"] = to!string(this.envelopeDivider);
+        state[id ~ ".envelopeCounter"] = to!string(this.envelopeCounter);
+        state[id ~ ".envelopeConstantVolume"] = to!string(this.envelopeConstantVolume);
     }
 
-    void load(string[string] state, string id) {
-        id = "apu.pulse" ~ id;
+    void load(string[string] state) {
+        auto id = "apu.pulse" ~ to!string(this.channel);
 
         this.enabled = to!bool(state[id ~ ".enabled"]);
         this.channel = to!ubyte(state[id ~ ".channel"]);
         this.lengthEnabled = to!bool(state[id ~ ".lengthEnabled"]);
+        this.lengthEnabledNewValue = to!bool(state[id ~ ".lengthEnabledNewValue"]);
         this.lengthValue = to!ubyte(state[id ~ ".lengthValue"]);
+        this.lengthValueNew = to!ubyte(state[id ~ ".lengthValueNew"]);
+        this.lengthValuePrev = to!ubyte(state[id ~ ".lengthValuePrev"]);
         this.timerPeriod = to!ushort(state[id ~ ".timerPeriod"]);
         this.timerValue = to!ushort(state[id ~ ".timerValue"]);
         this.dutyMode = to!ubyte(state[id ~ ".dutyMode"]);
@@ -545,23 +738,27 @@ struct Pulse {
         this.sweepNegate = to!bool(state[id ~ ".sweepNegate"]);
         this.sweepShift = to!ubyte(state[id ~ ".sweepShift"]);
         this.sweepPeriod = to!ubyte(state[id ~ ".sweepPeriod"]);
+        this.sweepTargetPeriod = to!uint(state[id ~ ".sweepTargetPeriod"]);
         this.sweepValue = to!ubyte(state[id ~ ".sweepValue"]);
         this.envelopeEnabled = to!bool(state[id ~ ".envelopeEnabled"]);
         this.envelopeLoop = to!bool(state[id ~ ".envelopeLoop"]);
         this.envelopeStart = to!bool(state[id ~ ".envelopeStart"]);
-        this.envelopePeriod = to!ubyte(state[id ~ ".envelopePeriod"]);
-        this.envelopeValue = to!ubyte(state[id ~ ".envelopeValue"]);
-        this.envelopeVolume = to!ubyte(state[id ~ ".envelopeVolume"]);
-        this.constantVolume = to!ubyte(state[id ~ ".constantVolume"]);
+        this.envelopeDivider = to!ubyte(state[id ~ ".envelopeDivider"]);
+        this.envelopeCounter = to!ubyte(state[id ~ ".envelopeCounter"]);
+        this.envelopeConstantVolume = to!ubyte(state[id ~ ".envelopeConstantVolume"]);
     }
 }
 
 // Triangle
 
 struct Triangle {
+    CPU cpu;
     bool   enabled;
     bool   lengthEnabled;
+    bool   lengthEnabledNewValue;
     ubyte  lengthValue;
+    ubyte  lengthValueNew;
+    ubyte  lengthValuePrev;
     ushort timerPeriod;
     ushort timerValue;
     ubyte  dutyValue;
@@ -569,19 +766,49 @@ struct Triangle {
     ubyte  counterValue;
     bool   counterReload;
 
+    void reset(bool powerUp) {
+        this.enabled = false;
+
+        this.timerPeriod = 0;
+        this.timerValue = 0;
+
+        // apu_reset: len_ctrs_enabled
+        // "At reset, length counters should be enabled, triangle unaffected"
+        if (powerUp) {
+            this.lengthEnabled = true;
+            this.lengthEnabledNewValue = true;
+            this.lengthValue = 0;
+            this.lengthValueNew = 0;
+            this.lengthValuePrev = 0;
+        }
+
+        this.counterValue = 0;
+        this.counterPeriod = 0;
+        this.counterReload = false;
+
+        this.dutyValue = 0; // hack to "fix" apu_mixer test
+    }
+
+    // 0x4008
     void writeControl(ubyte value) {
-        this.lengthEnabled = ((value >> 7) & 1) == 0;
+        this.lengthEnabledNewValue = ((value >> 7) & 1) == 0;
         this.counterPeriod = value & 0x7F;
     }
 
+    // 0x400A
     void writeTimerLow(ubyte value) {
         this.timerPeriod = (this.timerPeriod & 0xFF00) | cast(ushort)value;
     }
 
+    // 0x400B
     void writeTimerHigh(ubyte value) {
-        this.lengthValue = lengthTable[value >> 3];
+        if (this.enabled) {
+            this.lengthValueNew = lengthTable[value >> 3];
+            this.lengthValuePrev = this.lengthValue;
+        }
+
         this.timerPeriod = (this.timerPeriod & 0x00FF) | (cast(ushort)(value & 7) << 8);
-        this.timerValue = this.timerPeriod;
+
         this.counterReload = true;
     }
 
@@ -614,22 +841,32 @@ struct Triangle {
     }
 
     ubyte output() {
+        // Emulate 1 cycle delay
+        this.lengthEnabled = this.lengthEnabledNewValue;
+
+        // Emulate 1 cycle delay
+        if (this.lengthValueNew) {
+            if (this.lengthValue == this.lengthValuePrev) {
+                this.lengthValue = this.lengthValueNew;
+            }
+
+            this.lengthValueNew = 0;
+        }
+
         if (!this.enabled) {
             return 0;
         }
-        if (this.lengthValue == 0) {
-            return 0;
-        }
-        if (this.counterValue == 0) {
-            return 0;
-        }
+
         return triangleTable[this.dutyValue];
     }
 
     void save(string[string] state) {
         state["apu.triangle.enabled"] = to!string(this.enabled);
         state["apu.triangle.lengthEnabled"] = to!string(this.lengthEnabled);
+        state["apu.triangle.lengthEnabledNewValue"] = to!string(this.lengthEnabledNewValue);
         state["apu.triangle.lengthValue"] = to!string(this.lengthValue);
+        state["apu.triangle.lengthValueNew"] = to!string(this.lengthValueNew);
+        state["apu.triangle.lengthValuePrev"] = to!string(this.lengthValuePrev);
         state["apu.triangle.timerPeriod"] = to!string(this.timerPeriod);
         state["apu.triangle.timerValue"] = to!string(this.timerValue);
         state["apu.triangle.dutyValue"] = to!string(this.dutyValue);
@@ -641,7 +878,10 @@ struct Triangle {
     void load(string[string] state) {
         this.enabled = to!bool(state["apu.triangle.enabled"]);
         this.lengthEnabled = to!bool(state["apu.triangle.lengthEnabled"]);
+        this.lengthEnabledNewValue = to!bool(state["apu.triangle.lengthEnabledNewValue"]);
         this.lengthValue = to!ubyte(state["apu.triangle.lengthValue"]);
+        this.lengthValueNew = to!ubyte(state["apu.triangle.lengthValueNew"]);
+        this.lengthValuePrev = to!ubyte(state["apu.triangle.lengthValuePrev"]);
         this.timerPeriod = to!ushort(state["apu.triangle.timerPeriod"]);
         this.timerValue = to!ushort(state["apu.triangle.timerValue"]);
         this.dutyValue = to!ubyte(state["apu.triangle.dutyValue"]);
@@ -658,49 +898,69 @@ struct Noise {
     bool   mode;
     ushort shiftRegister;
     bool   lengthEnabled;
+    bool   lengthEnabledNewValue;
     ubyte  lengthValue;
+    ubyte  lengthValueNew;
+    ubyte  lengthValuePrev;
     ushort timerPeriod;
     ushort timerValue;
     bool   envelopeEnabled;
     bool   envelopeLoop;
     bool   envelopeStart;
-    ubyte  envelopePeriod;
-    ubyte  envelopeValue;
-    ubyte  envelopeVolume;
-    ubyte  constantVolume;
+    byte   envelopeDivider;
+    ubyte  envelopeCounter;
+    ubyte  envelopeConstantVolume;
 
+    void reset() {
+        this.timerPeriod = cast(ushort)(noiseTable[0] - 1);
+        this.shiftRegister = 1;
+        this.mode = false;
+
+        this.lengthEnabled = true;
+        this.lengthEnabledNewValue = true;
+        this.lengthValue = 0;
+        this.lengthValueNew = 0;
+        this.lengthValuePrev = 0;
+
+        this.envelopeEnabled = false;
+        this.envelopeLoop = false;
+        this.envelopeConstantVolume = 0;
+        this.envelopeCounter = 0;
+        this.envelopeStart = false;
+        this.envelopeDivider = 0;
+    }
+
+    // 0x400C
     void writeControl(ubyte value) {
-        this.lengthEnabled = ((value >> 5) & 1) == 0;
+        this.lengthEnabledNewValue = ((value >> 5) & 1) == 0;
         this.envelopeLoop = ((value >> 5) & 1) == 1;
         this.envelopeEnabled = ((value >> 4) & 1) == 0;
-        this.envelopePeriod = value & 15;
-        this.constantVolume = value & 15;
-        this.envelopeStart = true;
+        this.envelopeConstantVolume = value & 15;
     }
 
+    // 0x400E
     void writePeriod(ubyte value) {
         this.mode = (value & 0x80) == 0x80;
-        this.timerPeriod = noiseTable[value & 0x0F];
+        this.timerPeriod = cast(ushort)(noiseTable[value & 0x0F] - 1);
     }
 
+    // 0x400F
     void writeLength(ubyte value) {
-        this.lengthValue = lengthTable[value >> 3];
+        if (this.enabled) {
+            this.lengthValueNew = lengthTable[value >> 3];
+            this.lengthValuePrev = this.lengthValue;
+        }
+
         this.envelopeStart = true;
     }
 
     void stepTimer() {
         if (this.timerValue == 0) {
             this.timerValue = this.timerPeriod;
-            ubyte shift;
-            if (this.mode) {
-                shift = 6;
-            } else {
-                shift = 1;
-            }
-            auto b1 = this.shiftRegister & 1;
-            auto b2 = (this.shiftRegister >> shift) & 1;
+
+            ushort feedback = (this.shiftRegister & 0x01) ^ ((this.shiftRegister >> (this.mode ? 6 : 1)) & 0x01);
             this.shiftRegister >>= 1;
-            this.shiftRegister |= (b1 ^ b2) << 14;
+            this.shiftRegister |= (feedback << 14);
         } else {
             this.timerValue--;
         }
@@ -708,18 +968,20 @@ struct Noise {
 
     void stepEnvelope() {
         if (this.envelopeStart) {
-            this.envelopeVolume = 15;
-            this.envelopeValue = this.envelopePeriod;
             this.envelopeStart = false;
-        } else if (this.envelopeValue > 0) {
-            this.envelopeValue--;
-        } else {
-            if (this.envelopeVolume > 0) {
-                this.envelopeVolume--;
-            } else if (this.envelopeLoop) {
-                this.envelopeVolume = 15;
+            this.envelopeCounter = 15;
+            this.envelopeDivider = this.envelopeConstantVolume;
+        }  else {
+            this.envelopeDivider--;
+
+            if (this.envelopeDivider < 0) {
+                this.envelopeDivider = this.envelopeConstantVolume;
+                if (this.envelopeCounter > 0) {
+                    this.envelopeCounter--;
+                }
+                else if (this.envelopeLoop)
+                    this.envelopeCounter = 15;
             }
-            this.envelopeValue = this.envelopePeriod;
         }
     }
 
@@ -730,6 +992,18 @@ struct Noise {
     }
 
     ubyte output() {
+        // Emulate 1 cycle delay
+        this.lengthEnabled = this.lengthEnabledNewValue;
+
+        // Emulate 1 cycle delay
+        if (this.lengthValueNew) {
+            if (this.lengthValue == this.lengthValuePrev) {
+                this.lengthValue = this.lengthValueNew;
+            }
+
+            this.lengthValueNew = 0;
+        }
+
         if (!this.enabled) {
             return 0;
         }
@@ -740,9 +1014,9 @@ struct Noise {
             return 0;
         }
         if (this.envelopeEnabled) {
-            return this.envelopeVolume;
+            return this.envelopeCounter;
         } else {
-            return this.constantVolume;
+            return this.envelopeConstantVolume;
         }
     }
 
@@ -751,16 +1025,18 @@ struct Noise {
         state["apu.noise.mode"] = to!string(this.mode);
         state["apu.noise.shiftRegister"] = to!string(this.shiftRegister);
         state["apu.noise.lengthEnabled"] = to!string(this.lengthEnabled);
+        state["apu.noise.lengthEnabledNewValue"] = to!string(this.lengthEnabledNewValue);
         state["apu.noise.lengthValue"] = to!string(this.lengthValue);
+        state["apu.noise.lengthValueNew"] = to!string(this.lengthValueNew);
+        state["apu.noise.lengthValuePrev"] = to!string(this.lengthValuePrev);
         state["apu.noise.timerPeriod"] = to!string(this.timerPeriod);
         state["apu.noise.timerValue"] = to!string(this.timerValue);
         state["apu.noise.envelopeEnabled"] = to!string(this.envelopeEnabled);
         state["apu.noise.envelopeLoop"] = to!string(this.envelopeLoop);
         state["apu.noise.envelopeStart"] = to!string(this.envelopeStart);
-        state["apu.noise.envelopePeriod"] = to!string(this.envelopePeriod);
-        state["apu.noise.envelopeValue"] = to!string(this.envelopeValue);
-        state["apu.noise.envelopeVolume"] = to!string(this.envelopeVolume);
-        state["apu.noise.constantVolume"] = to!string(this.constantVolume);
+        state["apu.noise.envelopeDivider"] = to!string(this.envelopeDivider);
+        state["apu.noise.envelopeCounter"] = to!string(this.envelopeCounter);
+        state["apu.noise.envelopeConstantVolume"] = to!string(this.envelopeConstantVolume);
     }
 
     void load(string[string] state) {
@@ -768,16 +1044,18 @@ struct Noise {
         this.mode = to!bool(state["apu.noise.mode"]);
         this.shiftRegister = to!ushort(state["apu.noise.shiftRegister"]);
         this.lengthEnabled = to!bool(state["apu.noise.lengthEnabled"]);
+        this.lengthEnabledNewValue = to!bool(state["apu.noise.lengthEnabledNewValue"]);
         this.lengthValue = to!ubyte(state["apu.noise.lengthValue"]);
+        this.lengthValueNew = to!ubyte(state["apu.noise.lengthValueNew"]);
+        this.lengthValuePrev = to!ubyte(state["apu.noise.lengthValuePrev"]);
         this.timerPeriod = to!ushort(state["apu.noise.timerPeriod"]);
         this.timerValue = to!ushort(state["apu.noise.timerValue"]);
         this.envelopeEnabled = to!bool(state["apu.noise.envelopeEnabled"]);
         this.envelopeLoop = to!bool(state["apu.noise.envelopeLoop"]);
         this.envelopeStart = to!bool(state["apu.noise.envelopeStart"]);
-        this.envelopePeriod = to!ubyte(state["apu.noise.envelopePeriod"]);
-        this.envelopeValue = to!ubyte(state["apu.noise.envelopeValue"]);
-        this.envelopeVolume = to!ubyte(state["apu.noise.envelopeVolume"]);
-        this.constantVolume = to!ubyte(state["apu.noise.constantVolume"]);
+        this.envelopeDivider = to!ubyte(state["apu.noise.envelopeDivider"]);
+        this.envelopeCounter = to!ubyte(state["apu.noise.envelopeCounter"]);
+        this.envelopeConstantVolume = to!ubyte(state["apu.noise.envelopeConstantVolume"]);
     }
 }
 
@@ -798,21 +1076,41 @@ struct DMC {
     bool   loop;
     bool   irq;
 
+    void reset() {
+        this.tickPeriod = cast(ubyte)(dmcTable[0] - 1);
+        this.bitCount = 8;
+
+        this.value = 0;
+        this.sampleAddress = 0;
+        this.sampleLength = 0;
+        this.currentAddress = 0;
+        this.currentLength = 0;
+        this.shiftRegister = 0;
+        this.loop = false;
+        this.irq = false;
+    }
+
+    // 0x4010
     void writeControl(ubyte value) {
         this.irq = (value & 0x80) == 0x80;
         this.loop = (value & 0x40) == 0x40;
-        this.tickPeriod = dmcTable[value & 0x0F];
+        this.tickPeriod = cast(ubyte)(dmcTable[value & 0x0F] - 1);
+
+        if (!this.irq) this.cpu.clearIrqSource(IrqSource.DMC);
     }
 
+    // 0x4011
     void writeValue(ubyte value) {
         this.value = value & 0x7F;
     }
 
+    // 0x4012
     void writeAddress(ubyte value) {
         // Sample address = %11AAAAAA.AA000000
         this.sampleAddress = 0xC000 | (cast(ushort)value << 6);
     }
 
+    // 0x4013
     void writeLength(ubyte value) {
         // Sample length = %0000LLLL.LLLL0001
         this.sampleLength = (cast(ushort)value << 4) | 1;
@@ -846,8 +1144,13 @@ struct DMC {
                 this.currentAddress = 0x8000;
             }
             this.currentLength--;
-            if (this.currentLength == 0 && this.loop) {
-                this.restart();
+            if (this.currentLength == 0) {
+                if (this.loop) {
+                    this.restart();
+                }
+                else if (this.irq) {
+                    this.cpu.addIrqSource(IrqSource.DMC);
+                }
             }
         }
     }

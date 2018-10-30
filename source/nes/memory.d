@@ -2,6 +2,7 @@ module nes.memory;
 
 import std.experimental.logger;
 import std.format;
+import std.stdio;
 
 import nes.console;
 
@@ -88,7 +89,7 @@ class CPUMemory : Memory {
         }
     }
 
-    private Console console;
+    package Console console;
 }
 
 class PPUMemory : Memory {

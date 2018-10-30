@@ -25,47 +25,108 @@ class PPU : PPUMemory {
 
     void reset() {
         this.cycle = 340;
-        this.scanLine = 240;
+        this.scanLine = 261;
         this.frame = 0;
-        this.writeControl(0);
-        this.writeMask(0);
-        this.writeOAMAddress(0);
+
+        this.renderingEnabled = false;
+        this.prevRenderingEnabled = false;
+        this.renderingEnabledUpdated = false;
+
+        // NMI flags
+        this.nmiOccurred = false;
+        this.nmiOutput = false;
+        this.nmiPrevious = false;
+
+        // PPU registers
+        this.v = 0; // current vram address (15 bit)
+        this.t = 0; // temporary vram address (15 bit)
+        this.x = 0; // fine x scroll (3 bit)
+        this.w = 0; // write toggle (1 bit)
+        this.f = 1; // even/odd frame flag (1 bit)
+
+        this.vWriteDelay = 0;
+        this.vWriteValue = 0;
+        this.vReadIgnoreCounter = 0;
+
+        this.writeControl(0); // $2000 PPUCTRL
+        this.writeMask(0); // $2001 PPUMASK
+        this.writeOAMAddress(0); // $2003: OAMADDR
+
+        this.register = 0;
+
+        // background temporary variables
+        this.nameTableByte = 0;
+        this.attributeTableByte = 0;
+        this.lowTileByte = 0;
+        this.highTileByte = 0;
+        this.tileData = 0;
+
+        this.tileAddress = 0;
+
+        // sprite temporary variables
+        this.spriteCount = 0;
+        this.spritePatterns = [0, 0, 0, 0, 0, 0, 0, 0];
+        this.spritePositions = [0, 0, 0, 0, 0, 0, 0, 0];
+        this.spritePriorities = [0, 0, 0, 0, 0, 0, 0, 0];
+        this.spriteIndexes = [0, 0, 0, 0, 0, 0, 0, 0];
+
+        // $2002 PPUSTATUS
+        this.flagSpriteZeroHit = 0;
+        this.flagSpriteOverflow = 0;
+
+        // $2007 PPUDATA
+        this.bufferedData = 0; // for buffered reads
+
+        foreach (i; nameTableData) nameTableData[i] = 0;
+        paletteData = [0x09, 0x01, 0x00, 0x01, 0x00, 0x02, 0x02, 0x0D, 0x08,
+                       0x10, 0x08, 0x24, 0x00, 0x00, 0x04, 0x2C, 0x09, 0x01,
+                       0x34, 0x03, 0x00, 0x04, 0x00, 0x14, 0x08, 0x3A, 0x00,
+                       0x02, 0x00, 0x20, 0x2C, 0x08];
+        foreach (i; oamData) oamData[i] = 0;
+        foreach (i; front.pix) front.pix[i] = 0;
+        foreach (i; back.pix) back.pix[i] = 0;
+
+        foreach (_; 0 .. 28)
+            this.step();
     }
 
     // Step executes a single PPU cycle
     void step() {
         this.tick();
 
-        auto renderingEnabled = this.flagShowBackground != 0 || this.flagShowSprites != 0;
         auto preLine = this.scanLine == 261;
         auto visibleLine = this.scanLine < 240;
-        // auto postLine = this.scanLine == 240;
         auto renderLine = preLine || visibleLine;
         auto preFetchCycle = this.cycle >= 321 && this.cycle <= 336;
         auto visibleCycle = this.cycle >= 1 && this.cycle <= 256;
         auto fetchCycle = preFetchCycle || visibleCycle;
 
         // background logic
-        if (renderingEnabled) {
+        if (this.renderingEnabled) {
             if (visibleLine && visibleCycle) {
                 this.renderPixel();
             }
             if (renderLine && fetchCycle) {
                 this.tileData <<= 4;
-                switch (this.cycle % 8) {
-                    case 1:
+                switch ((this.cycle - 1) & 0x07) {
+                    case 0:
                         this.fetchNameTableByte();
+
+                        ushort fineY = (this.v >> 12) & 7;
+                        auto table = this.flagBackgroundTable;
+                        auto tile = this.nameTableByte;
+                        this.tileAddress = cast(ushort)(0x1000 * cast(ushort)table + cast(ushort)tile * 16 + fineY);
                         break;
-                    case 3:
+                    case 2:
                         this.fetchAttributeTableByte();
                         break;
-                    case 5:
+                    case 3:
                         this.fetchLowTileByte();
                         break;
-                    case 7:
+                    case 5:
                         this.fetchHighTileByte();
                         break;
-                    case 0:
+                    case 7:
                         this.storeTileData();
                         break;
                     default:
@@ -89,7 +150,7 @@ class PPU : PPUMemory {
         }
 
         // sprite logic
-        if (renderingEnabled) {
+        if (this.renderingEnabled) {
             if (this.cycle == 257) {
                 if (visibleLine) {
                     this.evaluateSprites();
@@ -100,14 +161,21 @@ class PPU : PPUMemory {
         }
 
         // vblank logic
-        if (this.scanLine == 241 && this.cycle == 1) {
-            this.setVerticalBlank();
+
+        if (this.renderingEnabledUpdated) {
+            this.updateRenderingEnabled();
         }
-        if (preLine && this.cycle == 1) {
-            this.clearVerticalBlank();
-            this.flagSpriteZeroHit = 0;
-            this.flagSpriteOverflow = 0;
+
+        if (this.vWriteDelay > 0) {
+            this.vWriteDelay--;
+            if (this.vWriteDelay == 0) {
+                this.v = this.vWriteValue;
+                // vram read should happen here
+            }
         }
+
+        if (this.vReadIgnoreCounter > 0)
+            this.vReadIgnoreCounter--;
     }
 
     ubyte readRegister(ushort address) {
@@ -163,6 +231,8 @@ class PPU : PPUMemory {
             address -= 16;
         }
 
+        if (this.flagGrayscale) return this.paletteData[address] & 0x30;
+
         return this.paletteData[address];
     }
 
@@ -190,7 +260,6 @@ class PPU : PPUMemory {
         state["ppu.nmiOccurred"] = to!string(this.nmiOccurred);
         state["ppu.nmiOutput"] = to!string(this.nmiOutput);
         state["ppu.nmiPrevious"] = to!string(this.nmiPrevious);
-        state["ppu.nmiDelay"] = to!string(this.nmiDelay);
         state["ppu.nameTableByte"] = to!string(this.nameTableByte);
         state["ppu.attributeTableByte"] = to!string(this.attributeTableByte);
         state["ppu.lowTileByte"] = to!string(this.lowTileByte);
@@ -219,6 +288,14 @@ class PPU : PPUMemory {
         state["ppu.flagSpriteOverflow"] = to!string(this.flagSpriteOverflow);
         state["ppu.oamAddress"] = to!string(this.oamAddress);
         state["ppu.bufferedData"] = to!string(this.bufferedData);
+        state["ppu.renderingEnabled"] = to!string(this.renderingEnabled);
+        state["ppu.prevRenderingEnabled"] = to!string(this.prevRenderingEnabled);
+        state["ppu.renderingEnabledUpdated"] = to!string(this.renderingEnabledUpdated);
+
+        state["ppu.vWriteValue"] = to!string(this.vWriteValue);
+        state["ppu.vWriteDelay"] = to!string(this.vWriteDelay);
+        state["ppu.vReadIgnoreCounter"] = to!string(this.vReadIgnoreCounter);
+        state["ppu.tileAddress"] = to!string(this.tileAddress);
     }
 
     void load(string[string] state) {
@@ -237,7 +314,6 @@ class PPU : PPUMemory {
         this.nmiOccurred = to!bool(state["ppu.nmiOccurred"]);
         this.nmiOutput = to!bool(state["ppu.nmiOutput"]);
         this.nmiPrevious = to!bool(state["ppu.nmiPrevious"]);
-        this.nmiDelay = to!ubyte(state["ppu.nmiDelay"]);
         this.nameTableByte = to!ubyte(state["ppu.nameTableByte"]);
         this.attributeTableByte = to!ubyte(state["ppu.attributeTableByte"]);
         this.lowTileByte = to!ubyte(state["ppu.lowTileByte"]);
@@ -266,6 +342,14 @@ class PPU : PPUMemory {
         this.flagSpriteOverflow = to!ubyte(state["ppu.flagSpriteOverflow"]);
         this.oamAddress = to!ubyte(state["ppu.oamAddress"]);
         this.bufferedData = to!ubyte(state["ppu.bufferedData"]);
+        this.renderingEnabled = to!bool(state["ppu.renderingEnabled"]);
+        this.prevRenderingEnabled = to!bool(state["ppu.prevRenderingEnabled"]);
+        this.renderingEnabledUpdated = to!bool(state["ppu.renderingEnabledUpdated"]);
+
+        this.vWriteValue = to!ushort(state["ppu.vWriteValue"]);
+        this.vWriteDelay = to!ubyte(state["ppu.vWriteDelay"]);
+        this.vReadIgnoreCounter = to!ubyte(state["ppu.vReadIgnoreCounter"]);
+        this.tileAddress = to!ushort(state["ppu.tileAddress"]);
     }
 
     package:
@@ -278,6 +362,10 @@ class PPU : PPUMemory {
         int   scanLine; // 0-261, 0-239=visible, 240=post, 241-260=vblank, 261=pre
         ulong frame;    // frame counter
 
+        bool renderingEnabled;
+        bool prevRenderingEnabled;
+        bool renderingEnabledUpdated;
+
         // storage variables
         ubyte[32]  paletteData;
         ubyte[256] oamData;
@@ -289,13 +377,16 @@ class PPU : PPUMemory {
         ubyte  w; // write toggle (1 bit)
         ubyte  f; // even/odd frame flag (1 bit)
 
+        ushort vWriteValue;
+        ubyte  vWriteDelay;
+        ubyte  vReadIgnoreCounter;
+
         ubyte register;
 
         // NMI flags
         bool  nmiOccurred;
         bool  nmiOutput;
         bool  nmiPrevious;
-        ubyte nmiDelay;
 
         // background temporary variables
         ubyte nameTableByte;
@@ -303,6 +394,8 @@ class PPU : PPUMemory {
         ubyte lowTileByte;
         ubyte highTileByte;
         ulong tileData;
+
+        ushort tileAddress;
 
         // sprite temporary variables
         int      spriteCount;
@@ -342,16 +435,30 @@ class PPU : PPUMemory {
     private:
         // $2000: PPUCTRL
         void writeControl(ubyte value) {
+            auto orgFlagIncrement = this.flagIncrement;
+            auto orgFlagBackgroundTable = this.flagBackgroundTable;
+
             this.flagNameTable = (value >> 0) & 3;
             this.flagIncrement = (value >> 2) & 1;
             this.flagSpriteTable = (value >> 3) & 1;
             this.flagBackgroundTable = (value >> 4) & 1;
             this.flagSpriteSize = (value >> 5) & 1;
             this.flagMasterSlave = (value >> 6) & 1;
+            auto prevNmiOutput = this.nmiOutput;
             this.nmiOutput = ((value >> 7) & 1) == 1;
             this.nmiChange();
             // t: ....BA.. ........ = d: ......BA
             this.t = (this.t & 0xF3FF) | ((cast(ushort)(value) & 0x03) << 10);
+
+            // Too late to turn off NMI
+            if (this.scanLine == 241 && this.cycle < 3 && !this.nmiOutput) {
+                this.console.cpu.clearNmiFlag();
+            }
+
+            // Too late to turn on NMI
+            if (this.scanLine == 261 && this.cycle == 0 && this.nmiOutput) {
+                this.console.cpu.clearNmiFlag();
+            }
         }
 
         // $2001: PPUMASK
@@ -364,6 +471,10 @@ class PPU : PPUMemory {
             this.flagRedTint = (value >> 5) & 1;
             this.flagGreenTint = (value >> 6) & 1;
             this.flagBlueTint = (value >> 7) & 1;
+
+            if (this.renderingEnabled != (this.flagShowBackground | this.flagShowSprites)) {
+                this.renderingEnabledUpdated = true;
+            }
         }
 
         // $2002: PPUSTATUS
@@ -372,12 +483,24 @@ class PPU : PPUMemory {
             result |= this.flagSpriteOverflow << 5;
             result |= this.flagSpriteZeroHit << 6;
             if (this.nmiOccurred) {
-                result |= 1 << 7;
+                result |= (1 << 7);
             }
+
+            if (this.scanLine == 241 && this.cycle < 3) {
+                this.console.cpu.clearNmiFlag();
+
+                if (this.cycle == 0) {
+                    result = this.register & 0x1F;
+                    result |= this.flagSpriteOverflow << 5;
+                    result |= this.flagSpriteZeroHit << 6;
+                }
+            }
+            
             this.nmiOccurred = false;
             this.nmiChange();
             // w:                   = 0
             this.w = 0;
+
             return result;
         }
 
@@ -428,54 +551,63 @@ class PPU : PPUMemory {
                 // v                    = t
                 // w:                   = 0
                 this.t = (this.t & 0xFF00) | cast(ushort)value;
-                this.v = this.t;
+                this.vWriteDelay = 2;
+                this.vWriteValue = this.t;
                 this.w = 0;
             }
         }
 
         // $2007: PPUDATA (read)
         ubyte readData() {
-            auto value = this.read(this.v);
-            // emulate buffered reads
-            if (this.v % 0x4000 < 0x3F00) {
-                auto buffered = this.bufferedData;
-                this.bufferedData = value;
-                value = buffered;
+            if (this.vReadIgnoreCounter == 0) {
+                auto value = this.read(this.v);
+                // emulate buffered reads
+                if (this.v % 0x4000 < 0x3F00) {
+                    auto buffered = this.bufferedData;
+                    this.bufferedData = value;
+                    value = buffered;
+                } else {
+                    this.bufferedData = this.read(cast(ushort)(this.v - 0x1000));
+                }
+
+                // increment address
+                if (this.scanLine >= 240 || !this.renderingEnabled) {
+                    if (this.flagIncrement == 0) {
+                        this.v += 1;
+                    } else {
+                        this.v += 32;
+                    }
+                    // should do a vram read here
+                } else {
+                    this.incrementX();
+                    this.incrementY();
+                }
+
+                return value;
             } else {
-                this.bufferedData = this.read(cast(ushort)(this.v - 0x1000));
+                return 0;
             }
-            // increment address
-            if (this.flagIncrement == 0) {
-                this.v += 1;
-            } else {
-                this.v += 32;
-            }
-            return value;
         }
 
         // $2007: PPUDATA (write)
         void writeData(ubyte value) {
             this.write(this.v, value);
-            if (this.flagIncrement == 0) {
-                this.v += 1;
+
+            if (this.scanLine >= 240 || !this.renderingEnabled) {
+                if (this.flagIncrement == 0) {
+                    this.v += 1;
+                } else {
+                    this.v += 32;
+                }
             } else {
-                this.v += 32;
+                this.incrementX();
+                this.incrementY();
             }
         }
 
         // $4014: OAMDMA
         void writeDMA(ubyte value) {
-            auto cpu = this.console.cpu;
-            ushort address = cast(ushort)value << 8;
-            foreach (_; 0 .. 256) {
-                this.oamData[this.oamAddress] = cpu.read(address);
-                this.oamAddress++;
-                address++;
-            }
-            cpu.stall += 513;
-            if (cpu.cycles % 2 == 1) {
-                cpu.stall++;
-            }
+            this.console.cpu.spriteDmaTransfer(value);
         }
 
         // NTSC Timing Helper Functions
@@ -503,6 +635,7 @@ class PPU : PPUMemory {
             } else {
                 // fine Y = 0
                 this.v &= 0x8FFF;
+
                 // let y = coarse Y
                 ushort y = (this.v & 0x03E0) >> 5;
                 if (y == 29) {
@@ -537,9 +670,7 @@ class PPU : PPUMemory {
         void nmiChange() {
             auto nmi = this.nmiOutput && this.nmiOccurred;
             if (nmi && !this.nmiPrevious) {
-                // TODO: this fixes some games but the delay shouldn't have to be so
-                // long, so the timings are off somewhere
-                this.nmiDelay = 15;
+                this.console.cpu.setNmiFlag();
             }
             this.nmiPrevious = nmi;
         }
@@ -569,19 +700,11 @@ class PPU : PPUMemory {
         }
 
         void fetchLowTileByte() {
-            ushort fineY = (this.v >> 12) & 7; // Port: Maybe should be ubyte
-            auto table = this.flagBackgroundTable;
-            auto tile = this.nameTableByte;
-            ushort address = cast(ushort)(0x1000 * cast(ushort)table + cast(ushort)tile * 16 + fineY);
-            this.lowTileByte = this.read(address);
+            this.lowTileByte = this.read(this.tileAddress);
         }
 
         void fetchHighTileByte() {
-            ushort fineY = (this.v >> 12) & 7; // Port: Maybe should be ubyte
-            auto table = this.flagBackgroundTable;
-            auto tile = this.nameTableByte;
-            ushort address = cast(ushort)(0x1000 * cast(ushort)table + cast(ushort)tile * 16 + fineY);
-            this.highTileByte = this.read(cast(ushort)(address + 8));
+            this.highTileByte = this.read(cast(ushort)(this.tileAddress + 8));
         }
 
         void storeTileData() {
@@ -632,6 +755,7 @@ class PPU : PPUMemory {
         void renderPixel() {
             auto x = this.cycle - 1;
             auto y = this.scanLine;
+
             auto background = this.backgroundPixel();
             auto sp = this.spritePixel();
             auto i = sp.index;
@@ -741,32 +865,49 @@ class PPU : PPUMemory {
             this.spriteCount = count;
         }
 
+        void updateRenderingEnabled() {
+            this.renderingEnabledUpdated = false;
+
+            this.prevRenderingEnabled = this.renderingEnabled;
+
+            this.renderingEnabled = this.flagShowBackground || this.flagShowSprites;
+
+            if (this.prevRenderingEnabled != this.renderingEnabled) {
+                this.renderingEnabledUpdated = true;
+            }
+        }
+
         // tick updates Cycle, ScanLine and Frame counters
         void tick() {
-            if (this.nmiDelay > 0) {
-                this.nmiDelay--;
-                if (this.nmiDelay == 0 && this.nmiOutput && this.nmiOccurred) {
-                    this.console.cpu.triggerNMI();
-                }
-            }
+            // we start on cycle 1 since we inc first
 
-            if (this.flagShowBackground != 0 || this.flagShowSprites != 0) {
-                if (this.f == 1 && this.scanLine == 261 && this.cycle == 339) {
-                    this.cycle = 0;
-                    this.scanLine = 0;
-                    this.frame++;
-                    this.f ^= 1;
-                    return;
-                }
-            }
-            this.cycle++;
-            if (this.cycle > 340) {
+            if (this.cycle > 339) {
+                // Cycle 0
                 this.cycle = 0;
+
                 this.scanLine++;
-                if (this.scanLine > 261) {
-                    this.scanLine = 0;
+
+                if (this.scanLine == 240) {
                     this.frame++;
                     this.f ^= 1;
+                } else if (this.scanLine == 241) {
+                    this.setVerticalBlank();
+                } else if (this.scanLine == 261) {
+                    this.flagSpriteZeroHit = 0;
+                    this.flagSpriteOverflow = 0;
+                } else if (this.scanLine > 261) {
+                    this.scanLine = 0;
+                }
+            } else {
+                // Cycle > 0
+                this.cycle++;
+
+                if (this.cycle == 1 && this.scanLine == 261) {
+                    this.clearVerticalBlank();
+                } else if (this.cycle == 339 && this.scanLine == 261) {
+                    if (this.f == 1 && (this.renderingEnabled)) {
+                        this.cycle = 340;
+                    }
                 }
             }
         }

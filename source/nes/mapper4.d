@@ -5,6 +5,7 @@ import std.format;
 
 import nes.cartridge;
 import nes.console;
+import nes.cpu;
 import nes.mapper;
 import nes.memory;
 
@@ -39,7 +40,7 @@ class Mapper4 : Mapper {
         } else {
             this.counter--;
             if (this.counter == 0 && this.irqEnable) {
-                this.console.cpu.triggerIRQ();
+                this.console.cpu.addIrqSource(IrqSource.External);
             }
         }
     }
@@ -177,6 +178,7 @@ class Mapper4 : Mapper {
 
         void writeIRQDisable(ubyte value) {
             this.irqEnable = false;
+            this.console.cpu.clearIrqSource(IrqSource.External);
         }
 
         void writeIRQEnable(ubyte value) {

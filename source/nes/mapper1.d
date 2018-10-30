@@ -40,6 +40,8 @@ class Mapper1 : Mapper {
     }
 
     void write(ushort address, ubyte value) {
+        import std.string : fromStringz;
+
         if (address < 0x2000) {
             auto bank = address / 0x1000;
             auto offset = address % 0x1000;

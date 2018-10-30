@@ -10,7 +10,6 @@ import nes.cartridge;
 import nes.color;
 import nes.controller;
 import nes.cpu;
-import nes.filter;
 import nes.image;
 import nes.ines;
 import nes.mapper;
@@ -43,22 +42,14 @@ class Console {
 
     void reset() {
         this.cpu.reset();
+        this.ppu.reset();
+        this.apu.reset();
     }
 
     int step() {
-        auto cpuCycles = this.cpu.step();
-        auto ppuCycles = cpuCycles * 3;
-
-        foreach (_; 0 .. ppuCycles) {
-            this.ppu.step();
-            this.mapper.step();
-        }
-
-        foreach (_; 0 .. cpuCycles) {
-            this.apu.step();
-        }
-
-        return cpuCycles;
+        auto prevCycles = this.cpu.cycles;
+        this.cpu.step();
+        return cast(int)(this.cpu.cycles - prevCycles);
     }
 
     int stepFrame() {
@@ -101,22 +92,11 @@ class Console {
     }
 
     void setAudioSampleRate(double sampleRate) {
-        if (sampleRate != 0) {
-            // Convert samples per second to cpu steps per sample
-            this.apu.sampleRate = CPUFrequency / sampleRate;
-            // Initialize filters
-            this.apu.filterChain = new FilterChain(
-                HighPassFilter(cast(float)sampleRate, 90),
-                HighPassFilter(cast(float)sampleRate, 440),
-                LowPassFilter(cast(float)sampleRate, 14000)
-            );
-        } else {
-            this.apu.filterChain = null;
-        }
+        this.apu.setAudioSampleRate(sampleRate);
     }
 
     void saveState(string fileName) {
-        string[string] state = ["version": "1"];
+        string[string] state = ["version": "2"];
 
         this.save(state);
 
@@ -127,12 +107,14 @@ class Console {
         write(fileName, data);
     }
 
-    void loadState(string fileName) {
+    void loadState(string fileName) {        
         auto stateData = read(fileName);
 
         stateData = cast(ubyte[])std.zlib.uncompress(cast(void[])stateData);
 
         string[string] state = to!(string[string])(cast(string)stateData);
+
+        if (state["version"] != "2") return;
 
         load(state);
     }

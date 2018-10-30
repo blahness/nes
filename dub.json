@@ -1,6 +1,6 @@
 {
     "name": "nes",
-    "description": "NES emulator written in D",
+    "description": "NES emulator library written in D",
     "authors": ["Blahness"],
     "license": "MIT License",
     "targetType": "library",
