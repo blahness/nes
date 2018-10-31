@@ -36,7 +36,7 @@ enum {
 }
 
 // instructionModes indicates the addressing mode for each instruction
-ubyte[256] instructionModes = [
+immutable ubyte[256] instructionModes = [
     modeImplied,   modeIndexedIndirect,     modeImplied,   modeIndexedIndirect,     modeZeroPage,  modeZeroPage,  modeZeroPage,  modeZeroPage,  modeImplied, modeImmediate,     modeAccumulator, modeImmediate,     modeAbsolute,      modeAbsolute,      modeAbsolute,      modeAbsolute,
     modeRelative,  modeIndirectIndexedRead, modeImplied,   modeIndirectIndexed,     modeZeroPageX, modeZeroPageX, modeZeroPageX, modeZeroPageX, modeImplied, modeAbsoluteYRead, modeImplied,     modeAbsoluteY,     modeAbsoluteXRead, modeAbsoluteXRead, modeAbsoluteX,     modeAbsoluteX,
     modeAbsolute,  modeIndexedIndirect,     modeImplied,   modeIndexedIndirect,     modeZeroPage,  modeZeroPage,  modeZeroPage,  modeZeroPage,  modeImplied, modeImmediate,     modeAccumulator, modeImmediate,     modeAbsolute,      modeAbsolute,      modeAbsolute,      modeAbsolute,
@@ -56,7 +56,7 @@ ubyte[256] instructionModes = [
 ];
 
 // instructionSizes indicates the size of each instruction in bytes
-ubyte[256] instructionSizes = [
+immutable ubyte[256] instructionSizes = [
     1, 2, 1, 2, 2, 2, 2, 2, 1, 2, 1, 2, 3, 3, 3, 3,
     2, 2, 0, 2, 2, 2, 2, 2, 1, 3, 1, 3, 3, 3, 3, 3,
     3, 2, 0, 2, 2, 2, 2, 2, 1, 2, 1, 2, 3, 3, 3, 3,
@@ -76,7 +76,7 @@ ubyte[256] instructionSizes = [
 ];
 
 // instructionNames indicates the name of each instruction
-string[256] instructionNames = [
+immutable string[256] instructionNames = [
     "BRK", "ORA", "KIL", "SLO", "NOP", "ORA", "ASL", "SLO", "PHP", "ORA", "ASL", "AAC", "NOP", "ORA", "ASL", "SLO",
     "BPL", "ORA", "KIL", "SLO", "NOP", "ORA", "ASL", "SLO", "CLC", "ORA", "NOP", "SLO", "NOP", "ORA", "ASL", "SLO",
     "JSR", "AND", "KIL", "RLA", "BIT", "AND", "ROL", "RLA", "PLP", "AND", "ROL", "AAC", "BIT", "AND", "ROL", "RLA",

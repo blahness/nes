@@ -146,7 +146,7 @@ enum {
     MirrorFour       = 4
 }
 
-ushort[4][] MirrorLookup = [
+immutable ushort[4][] MirrorLookup = [
     [0, 0, 1, 1],
     [0, 1, 0, 1],
     [0, 0, 0, 0],

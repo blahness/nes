@@ -216,7 +216,7 @@ int blip_read_samples(blip_t* m, short* _out, int count, int stereo) {
 }
 
 /* Sinc_Generator(0.9, 0.55, 4.5) */
-const short[half_width][phase_count + 1] bl_step =
+immutable short[half_width][phase_count + 1] bl_step =
 [
 	[   43, -115,  350, -488, 1136, -914, 5861,21022],
 	[   44, -118,  348, -473, 1076, -799, 5274,21001],

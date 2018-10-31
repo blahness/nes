@@ -11,45 +11,49 @@ import blip_buf;
 
 enum MAX_SAMPLE_RATE = 96000;
 
-ulong[6][2] stepCycles = [[7457, 14913, 22371, 29828, 29829, 29830],
-                          [7457, 14913, 22371, 29829, 37281, 37282]];
+immutable ulong[6][2] stepCycles = [[7457, 14913, 22371, 29828, 29829, 29830],
+                                    [7457, 14913, 22371, 29829, 37281, 37282]];
 
-ubyte[] lengthTable = [
+immutable ubyte[] lengthTable = [
     10, 254, 20, 2, 40, 4, 80, 6, 160, 8, 60, 10, 14, 12, 26, 14,
     12, 16, 24, 18, 48, 20, 96, 22, 192, 24, 72, 26, 16, 28, 32, 30
 ];
 
-ubyte[][] dutyTable = [
+immutable ubyte[][] dutyTable = [
     [0, 1, 0, 0, 0, 0, 0, 0],
     [0, 1, 1, 0, 0, 0, 0, 0],
     [0, 1, 1, 1, 1, 0, 0, 0],
     [1, 0, 0, 1, 1, 1, 1, 1]
 ];
 
-ubyte[] triangleTable = [
+immutable ubyte[] triangleTable = [
     15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
 ];
 
-ushort[] noiseTable = [
+immutable ushort[] noiseTable = [
     4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068
 ];
 
-ubyte[] dmcTable = [
+immutable ubyte[] dmcTable = [
     214, 190, 170, 160, 143, 127, 113, 107, 95, 80, 71, 64, 53, 42, 36, 27
 ];
 
-float[31] pulseTable;
-float[203] tndTable;
+immutable float[31] pulseTable =
+    () {
+        float[31] result;
+        foreach (i; 0 .. 31)
+            result[i] = 95.52 / (8128.0 / cast(float)i + 100);
+        return result;
+    }();
 
-static this() {
-    foreach (i; 0 .. 31) {
-        pulseTable[i] = 95.52 / (8128.0 / cast(float)i + 100);
-    }
-    foreach (i; 0 .. 203) {
-        tndTable[i] = 163.67 / (24329.0 / cast(float)i + 100);
-    }
-}
+immutable float[203] tndTable =
+    () {
+        float[203] result;
+        foreach (i; 0 .. 203)
+            result[i] = 163.67 / (24329.0 / cast(float)i + 100);
+        return result;
+    }();
 
 alias void delegate(short) ApuCallbackFuncType;
 
